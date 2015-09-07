@@ -1,0 +1,9 @@
+.PP
+The GTPUSP target will allow the marking of packets relative to a GTPU tunnel, enabling the conntrack of decapsulated packets (going to internet).
+.TP
+\fB\-\-log\-level\fR \fIlevel\fR
+A logging level between 0 and 8 (inclusive).
+.TP
+\fB\-\-log\-prefix\fR \fIstring\fR
+Prefix log messages with the specified prefix; up to 29 bytes long, and useful
+for distinguishing messages in the logs.
