@@ -508,7 +508,7 @@ gtpusp_ksocket_receive (
 
   iov.iov_base = buf_pP;
   iov.iov_len = lenP;
-#if defined(FLAG_GTPV1U_KERNEL_THREAD_SOCK_NO_WAIT)
+#if FLAG_GTPV1U_KERNEL_THREAD_SOCK_NO_WAIT
   msg.msg_flags = MSG_DONTWAIT;
 #else
   msg.msg_flags = 0;
