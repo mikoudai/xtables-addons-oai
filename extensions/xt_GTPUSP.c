@@ -25,6 +25,7 @@
 #include <linux/in.h>
 #include <linux/icmp.h>
 #include <net/udp.h>
+#include <net/udp_tunnel.h>
 #include <net/inet_sock.h>
 #include <net/route.h>
 #include <net/addrconf.h>
@@ -39,7 +40,9 @@
 #include <linux/netdevice.h>
 #include <linux/delay.h>
 #include <linux/inet.h>
-
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
+#include <linux/uio.h>
+#endif
 // CONNMARK
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_ecache.h>
@@ -55,7 +58,7 @@
 #define INT_MODULE_PARM(n, v) static int n = v; module_param(n, int, 0444)
 #define STRING_MODULE_PARM(s, v) static char* s = v; module_param(s, charp, 0000);
 
-#define FLAG_GTPV1U_KERNEL_THREAD_SOCK_NO_WAIT 0
+#define FLAG_GTPV1U_KERNEL_THREAD_SOCK_NO_WAIT 1
 //-----------------------------------------------------------------------------
 
 static void  gtpusp_tg4_add (
@@ -81,27 +84,6 @@ static int __init gtpusp_tg_init (
 
 static void __exit gtpusp_tg_exit (
   void);
-static int gtpusp_udp_thread (
-  void *data);
-
-static int gtpusp_ksocket_send (
-  struct socket *sock_pP,
-  struct sockaddr_in *addr_pP,
-  unsigned char *gtpuh_pP,
-  int len_gtpP,
-  unsigned char *buf_ip_pP,
-  int len_ipP);
-
-static int gtpusp_ksocket_receive (
-  struct socket *sock_pP,
-  struct sockaddr_in *addr_pP,
-  unsigned char *buf_pP,
-  int lenP);
-
-static int gtpusp_ksocket_process_gtp (
-  const unsigned char *const rx_buf_pP,
-  const int lenP,
-  unsigned char *tx_buf_pP);
 
 //-----------------------------------------------------------------------------
 #define MODULE_NAME "GTPUSP"
@@ -158,18 +140,21 @@ typedef struct gtpv1u_msg_s {
 
 struct gtpuhdr {
   char                                    flags;
-  char                                    msgtype;
+  unsigned char                           msgtype;
   u_int16_t                               length;
   u_int32_t                               tunid;
 };
-typedef struct gtpusp_sock_s {
-  struct task_struct                     *thread;
+
+typedef struct gtpusp_data_priv_s {
   struct sockaddr_in                      addr;
-  struct socket                          *sock;
   struct sockaddr_in                      addr_send;
-  int                                     running;
-  int                                     thread_stop_requested;
-} gtpusp_sock_t;
+  struct udp_port_cfg                     udp_conf;
+  struct socket                          *sock;
+#define GTPUSP_GTP_RX_BUFFER_SIZE       8192
+#define GTPUSP_GTP_TX_BUFFER_SIZE       1024
+  //unsigned char                           gtp_rx_buf[GTPUSP_GTP_RX_BUFFER_SIZE];
+  unsigned char                           gtp_tx_buf[GTPUSP_GTP_TX_BUFFER_SIZE];
+} gtpusp_data_priv_t;
 
 //-----------------------------------------------------------------------------
 #define GTPU_HDR_PNBIT 1
@@ -188,8 +173,8 @@ typedef struct gtpusp_sock_s {
   (uint8_t)((addr & 0x00FF0000) >> 16), \
   (uint8_t)((addr & 0xFF000000) >> 24)
 //-----------------------------------------------------------------------------
-gtpusp_sock_t                           gtpusp_sock;
-
+gtpusp_data_priv_t                           gtpusp_data;
+static char                             gtpusp_print_buffer[GTPUSP_2_PRINT_BUFFER_LEN];
 INT_MODULE_PARM (gtpu_sgw_port, 2152);
 MODULE_PARM_DESC (gtpu_sgw_port, "UDP port number for S1U interface (s-GW side)");
 INT_MODULE_PARM (gtpu_enb_port, 2153);
@@ -198,7 +183,68 @@ STRING_MODULE_PARM (sgw_addr, "127.0.0.1");
 MODULE_PARM_DESC (sgw_addr, "IPv4 address of the S1U IP interface");
 
 
+//-----------------------------------------------------------------------------
+void
+_gtpusp_print_hex_octets(const unsigned char const * data_pP, const unsigned short sizeP)
+{
 
+  unsigned long octet_index = 0;
+  unsigned long buffer_marker = 0;
+  unsigned char aindex;
+  struct timeval tv;
+  char timeofday[64];
+  unsigned int h,m,s;
+
+  if (data_pP == NULL) {
+    return;
+  }
+
+  if (sizeP > 2000) {
+    return;
+  }
+
+  do_gettimeofday(&tv);
+  h = (tv.tv_sec/3600) % 24;
+  m = (tv.tv_sec / 60) % 60;
+  s = tv.tv_sec % 60;
+  snprintf(timeofday, 64, "%02d:%02d:%02d.%06ld", h,m,s,tv.tv_usec);
+
+  buffer_marker+=snprintf(&gtpusp_print_buffer[buffer_marker], GTPUSP_2_PRINT_BUFFER_LEN - buffer_marker,"%s------+-------------------------------------------------+\n",timeofday);
+  buffer_marker+=snprintf(&gtpusp_print_buffer[buffer_marker], GTPUSP_2_PRINT_BUFFER_LEN - buffer_marker,"%s      |  0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f |\n",timeofday);
+  buffer_marker+=snprintf(&gtpusp_print_buffer[buffer_marker], GTPUSP_2_PRINT_BUFFER_LEN - buffer_marker,"%s------+-------------------------------------------------+\n",timeofday);
+  pr_info("%s",gtpusp_print_buffer);
+  buffer_marker = 0;
+
+  for (octet_index = 0; octet_index < sizeP; octet_index++) {
+    if ((octet_index % 16) == 0) {
+      if (octet_index != 0) {
+        buffer_marker+=snprintf(&gtpusp_print_buffer[buffer_marker], GTPUSP_2_PRINT_BUFFER_LEN - buffer_marker, " |\n");
+        pr_info("%s",gtpusp_print_buffer);
+        buffer_marker = 0;
+      }
+
+      buffer_marker+=snprintf(&gtpusp_print_buffer[buffer_marker], GTPUSP_2_PRINT_BUFFER_LEN - buffer_marker, "%s %04ld |",timeofday, octet_index);
+    }
+
+    /*
+     * Print every single octet in hexadecimal form
+     */
+    buffer_marker+=snprintf(&gtpusp_print_buffer[buffer_marker], GTPUSP_2_PRINT_BUFFER_LEN - buffer_marker, " %02x", data_pP[octet_index]);
+    /*
+     * Align newline and pipes according to the octets in groups of 2
+     */
+  }
+
+  /*
+   * Append enough spaces and put final pipe
+   */
+  for (aindex = octet_index; aindex < 16; ++aindex)
+    buffer_marker+=snprintf(&gtpusp_print_buffer[buffer_marker], GTPUSP_2_PRINT_BUFFER_LEN - buffer_marker, "   ");
+
+  //SGI_IF_DEBUG("   ");
+  buffer_marker+=snprintf(&gtpusp_print_buffer[buffer_marker], GTPUSP_2_PRINT_BUFFER_LEN - buffer_marker, " |\n");
+  pr_info("%s",gtpusp_print_buffer);
+}
 //-----------------------------------------------------------------------------
 #if 0 // GTPUSP_TRACE_PACKET 
 static char *
@@ -296,92 +342,20 @@ gtpusp_nf_inet_hook_2_string (
 #endif 
 // for uplink GTPU traffic on S-GW
 //-----------------------------------------------------------------------------
-static int
-gtpusp_udp_thread (
-  void *data)
-{
-  int                                     size,
-                                          tx_size;
-  int                                     bufsize = 8192;
-
-#if FLAG_GTPV1U_KERNEL_THREAD_SOCK_NO_WAIT
-  int                                     success_read = 0;
-  int                                     failed_read = 0;
-#endif
-  unsigned char                           buf[bufsize + 1];
-  unsigned char                           gtp_resp[1024];
-
-  /*
-   * kernel thread initialization
-   */
-  gtpusp_sock.running = 1;
-  printk("%s: listening on port %d\n",MODULE_NAME , gtpu_sgw_port);
-
-  /*
-   * main loop
-   */
-  while (gtpusp_sock.thread_stop_requested == 0) {
-    if (kthread_should_stop ()) {
-      gtpusp_sock.running = 0;
-      printk("%s: kthread_stop initiated exit at %lu \n", MODULE_NAME, jiffies);
-      return -1;                //Exit from the thread. Return value will be passed to kthread_stop()
-    }
-
-    size = gtpusp_ksocket_receive (gtpusp_sock.sock, &gtpusp_sock.addr, buf, bufsize);
-
-    if (size <= 0) {
-      if (size != -EAGAIN) {
-        printk("%s: error getting datagram, sock_recvmsg error = %d\n",MODULE_NAME , size);
-      }
-#if FLAG_GTPV1U_KERNEL_THREAD_SOCK_NO_WAIT
-      success_read = 0;
-      failed_read += 1;
-
-      if (failed_read > 10)
-        failed_read = 10;
-
-      usleep_range (failed_read * 20, failed_read * 200);
-#endif
-    } else {
-#if FLAG_GTPV1U_KERNEL_THREAD_SOCK_NO_WAIT
-      success_read += 1;
-      failed_read = 0;
-#endif
-
-      if ((tx_size = gtpusp_ksocket_process_gtp (buf, size, gtp_resp)) > 0) {
-        //ksocket_send(gtpusp_sock.sock, &gtpusp_sock.addr_send, buf, gtp_resp, tx_size, NULL, 0));
-      }
-    }
-  }
-
-  gtpusp_sock.running = 0;
-
-  if (kthread_should_stop ()) {
-    printk("%s: kthread_stop initiated exit at %lu \n",MODULE_NAME , jiffies);
-    return -1;                  //Exit from the thread. Return value will be passed to kthread_stop()
-  }
-
-  printk("%s: kthread do_exit()\n",MODULE_NAME);
-  do_exit (0);
-}
 
 //-----------------------------------------------------------------------------
-static int
-gtpusp_ksocket_process_gtp (
-  const unsigned char *const rx_buf_pP,
-  const int lenP,
-  unsigned char *tx_buf_pP)
+/* Callback from net/ipv4/udp.c to receive packets */
+static int gtpusp_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 {
-  gtpv1u_msg_t                            gtpv1u_msg;
-  uint8_t                                 msg_type;
-  struct iphdr                           *iph_p = NULL;
-  struct iphdr                           *new_iph_p = NULL;
-  struct sk_buff                         *skb_p = NULL;
-  const unsigned char                    *rx_buf_p = rx_buf_pP;
-  int                                     err = 0;
-  struct rtable                          *rt = NULL;
-
-  struct flowi                            fl = {
+  struct gtpuhdr      *gtph_p    = NULL;
+  gtpv1u_msg_t         gtpv1u_msg;
+  int                  gtpu_extra_length = 0;
+  const unsigned char *rx_buf_p  = NULL;
+  struct iphdr        *iph_p     = NULL;
+  struct iphdr        *new_iph_p = NULL;
+  struct rtable       *rt        = NULL;
+  struct sk_buff      *skb_p     = NULL;
+  struct flowi         fl = {
     .u = {
           .ip4 = {
                   .daddr = 0,
@@ -390,56 +364,69 @@ gtpusp_ksocket_process_gtp (
                   }
           }
   };
-  msg_type = rx_buf_pP[1];
 
-  switch (msg_type) {
-  case GTP_ECHO_REQ:
-    printk("%s: TODO GTP ECHO_REQ, SEND TO GTPV1U TASK USER SPACE\n",MODULE_NAME);
-    //TODO;
-    return 0;
-    break;
+  /* Need gtpu and ip header to be present */
+  if (!pskb_may_pull(skb, sizeof(struct gtpuhdr) + sizeof(struct iphdr)))
+    goto error;
 
-  case GTP_ERROR_INDICATION:
-    printk("%s:TODO GTP ERROR INDICATION, SEND TO GTPV1U TASK USER SPACE\n",MODULE_NAME);
-    //TODO;
-    return 0;
-    break;
+  /* Return packets with reserved bits set */
+  gtph_p = (struct gtpuhdr *)(udp_hdr(skb) + 1);
 
-  case GTP_ECHO_RSP:
-    printk("%s:GTP ECHO_RSP, SEND TO GTPV1U TASK USER SPACE\n",MODULE_NAME);
-    return 0;
-    break;
+  //_gtpusp_print_hex_octets((const unsigned char*)skb->data, skb->len);
+  switch (gtph_p->msgtype) {
+    case GTP_ECHO_REQ:
+      printk("%s: TODO GTP ECHO_REQ, SEND TO GTPV1U TASK USER SPACE\n",MODULE_NAME);
+      //TODO;
+      goto drop;
+      break;
 
-  case GTP_GPDU:{
-      gtpv1u_msg.version = ((*rx_buf_p) & 0xE0) >> 5;
-      gtpv1u_msg.protocol_type = ((*rx_buf_p) & 0x10) >> 4;
-      gtpv1u_msg.ext_hdr_flag = ((*rx_buf_p) & 0x04) >> 2;
-      gtpv1u_msg.seq_num_flag = ((*rx_buf_p) & 0x02) >> 1;
-      gtpv1u_msg.npdu_num_flag = ((*rx_buf_p) & 0x01);
-      rx_buf_p++;
-      gtpv1u_msg.msg_type = *(rx_buf_p);
-      rx_buf_p++;
-      rx_buf_p += 2;
-      gtpv1u_msg.teid = ntohl (*((u_int32_t *) rx_buf_p));
-      rx_buf_p += 4;
+    case GTP_ERROR_INDICATION:
+      printk("%s:TODO GTP ERROR INDICATION, SEND TO GTPV1U TASK USER SPACE\n",MODULE_NAME);
+      //TODO;
+      goto drop;
+      break;
+
+    case GTP_ECHO_RSP:
+      printk("%s:GTP ECHO_RSP, SEND TO GTPV1U TASK USER SPACE\n",MODULE_NAME);
+      goto drop;
+      break;
+
+    case GTP_GPDU:
+      printk("%s:GTP GPDU\n",MODULE_NAME);
+      gtpv1u_msg.version       = ((gtph_p->flags) & 0xE0) >> 5;
+      gtpv1u_msg.protocol_type = ((gtph_p->flags) & 0x10) >> 4;
+      gtpv1u_msg.ext_hdr_flag  = ((gtph_p->flags) & 0x04) >> 2;
+      gtpv1u_msg.seq_num_flag  = ((gtph_p->flags) & 0x02) >> 1;
+      gtpv1u_msg.npdu_num_flag = ((gtph_p->flags) & 0x01);
+      gtpv1u_msg.teid          = ntohl (gtph_p->tunid);
+      rx_buf_p = (const unsigned char *)&gtph_p[1];
 
       if (gtpv1u_msg.ext_hdr_flag || gtpv1u_msg.seq_num_flag || gtpv1u_msg.npdu_num_flag) {
         gtpv1u_msg.seq_num = ntohs (*(((u_int16_t *) rx_buf_p)));
         rx_buf_p += 2;
+        gtpu_extra_length += 2;
         gtpv1u_msg.npdu_num = *(rx_buf_p++);
         gtpv1u_msg.next_ext_hdr_type = *(rx_buf_p++);
+        gtpu_extra_length += 2;
       }
 
-      gtpv1u_msg.msg_buf_offset = (u_int32_t) (rx_buf_p - rx_buf_pP);
-      gtpv1u_msg.msg_buf_len = lenP - gtpv1u_msg.msg_buf_offset;
-      gtpv1u_msg.msg_len = lenP;
-      iph_p = (struct iphdr *)(&rx_buf_pP[gtpv1u_msg.msg_buf_offset]);
+      if (iptunnel_pull_header(skb, sizeof(struct udphdr) + sizeof(struct gtpuhdr) + gtpu_extra_length, htons(ETH_P_IP)))
+        goto drop;
+
+      skb_reset_network_header(skb);
+      skb_reset_mac_header(skb);
+      skb->mark = gtpv1u_msg.teid;
+
+      // LG: Here some work to do: do not copy skb but forward it in the good way (still to be understood)
+      // here it is not a network driver (have a look at kernel src drivers/net/vxlan.c)
+
+      iph_p = (struct iphdr *)(skb->data);
       fl.u.ip4.daddr = iph_p->daddr;
       fl.u.ip4.flowi4_tos = RT_TOS (iph_p->tos);
       rt = ip_route_output_key (&init_net, &fl.u.ip4);
 
       if (rt == NULL) {
-        printk("%s: Failed to route packet to dst 0x%x. Error: (%d)\n",MODULE_NAME, fl.u.ip4.daddr, err);
+        printk("%s: Failed to route packet to dst 0x%x.\n",MODULE_NAME, fl.u.ip4.daddr);
         return NF_DROP;
       }
 
@@ -448,14 +435,14 @@ gtpusp_ksocket_process_gtp (
         return 0;
       }
 
-      skb_p = alloc_skb (LL_MAX_HEADER + ntohs (iph_p->tot_len), GFP_ATOMIC);
+      skb_p = alloc_skb (LL_MAX_HEADER + ntohs (iph_p->tot_len), GFP_ATOMIC); // may be when S5 add more room
 
       if (skb_p == NULL) {
         return 0;
       }
 
       skb_p->priority = rt_tos2priority (iph_p->tos);
-      skb_p->pkt_type = PACKET_OTHERHOST;
+      skb_p->pkt_type = PACKET_OTHERHOST; // next: try PACKET_OUTGOING
       skb_dst_set (skb_p, dst_clone (&rt->dst));
       skb_p->dev = skb_dst (skb_p)->dev;
       skb_reserve (skb_p, LL_MAX_HEADER + ntohs (iph_p->tot_len));
@@ -472,123 +459,28 @@ gtpusp_ksocket_process_gtp (
       skb_p->ip_summed = CHECKSUM_NONE;
 
       if (skb_p->len > dst_mtu (skb_dst (skb_p))) {
-        goto free_skb;
+        printk("%s: Dropped skb\n",MODULE_NAME);
+        kfree_skb (skb_p);
+        goto drop;
       }
-
+      // could be ip_send_skb() but ip_local_out is what is done inside ip_send_skb()
       ip_local_out (skb_p);
+      goto drop;
+
       return 0;
-    free_skb:
-      printk("%s: Dropped skb\n",MODULE_NAME);
-      kfree_skb (skb_p);
-      return 0;
-    }
-    break;
-
-  default:
-    printk("%s:ERROR GTPU msg type %u\n",MODULE_NAME, msg_type);
-    return 0;
+      break;
   }
+
+drop:
+  /* Consume bad ... and good packet */
+  kfree_skb(skb);
+  return 0;
+
+error:
+  /* Return non gtp pkt */
+  return 1;
 }
 
-//-----------------------------------------------------------------------------
-static int
-gtpusp_ksocket_receive (
-  struct socket *sock_pP,
-  struct sockaddr_in *addr_pP,
-  unsigned char *buf_pP,
-  int lenP)
-{
-  struct msghdr                           msg;
-  struct iovec                            iov;
-  mm_segment_t                            oldfs;
-  int                                     size = 0;
-
-  if (sock_pP->sk == NULL)
-    return 0;
-
-  iov.iov_base = buf_pP;
-  iov.iov_len = lenP;
-#if FLAG_GTPV1U_KERNEL_THREAD_SOCK_NO_WAIT
-  msg.msg_flags = MSG_DONTWAIT;
-#else
-  msg.msg_flags = 0;
-#endif
-  msg.msg_name = addr_pP;
-  msg.msg_namelen = sizeof (struct sockaddr_in);
-  msg.msg_control = NULL;
-  msg.msg_controllen = 0;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-#else
-  iov_iter_init(&msg.msg_iter, READ, &iov, 1, 0);
-#endif
-  msg.msg_control = NULL;
-  oldfs = get_fs ();
-  set_fs (KERNEL_DS);
-  size = sock_recvmsg (sock_pP, &msg, lenP, msg.msg_flags);
-  set_fs (oldfs);
-  return size;
-}
-
-//-----------------------------------------------------------------------------
-static int
-gtpusp_ksocket_send (
-  struct socket *sock_pP,
-  struct sockaddr_in *addr_pP,
-  unsigned char *gtpuh_pP,
-  int len_gtpP,
-  unsigned char *buf_ip_pP,
-  int len_ipP)
-{
-  struct msghdr                           msg;
-  struct iovec                            iov[2];
-  mm_segment_t                            oldfs;
-  int                                     size = 0;
-  int                                     err = 0;
-  int                                     iov_index = 0;
-
-  if ((err = sock_pP->ops->connect (sock_pP, (struct sockaddr *)addr_pP, sizeof (struct sockaddr), 0)) < 0) {
-    printk("%s: Could not connect to socket, error = %d\n",MODULE_NAME, -err);
-    return 0;
-  }
-
-  if (sock_pP->sk == NULL) {
-    return 0;
-  }
-
-  if ((gtpuh_pP != NULL) && (len_gtpP > 0)) {
-    iov[iov_index].iov_base = gtpuh_pP;
-    iov[iov_index].iov_len = len_gtpP;
-    iov_index += 1;
-  }
-
-  if ((buf_ip_pP != NULL) && (len_ipP > 0)) {
-    iov[iov_index].iov_base = buf_ip_pP;
-    iov[iov_index].iov_len = len_ipP;
-    iov_index += 1;
-  }
-
-  msg.msg_flags = 0;
-  msg.msg_name = addr_pP;
-  msg.msg_namelen = sizeof (struct sockaddr_in);
-  msg.msg_control = NULL;
-  msg.msg_controllen = 0;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
-  msg.msg_iov = iov;
-  msg.msg_iovlen = iov_index;
-#else
-  iov_iter_init(&msg.msg_iter, WRITE,
-                iov, iov_index,
-                len_gtpP+len_ipP);
-#endif
-  msg.msg_control = NULL;
-  oldfs = get_fs ();
-  set_fs (KERNEL_DS);
-  size = sock_sendmsg (sock_pP, &msg, len_ipP + len_gtpP);
-  set_fs (oldfs);
-  return size;
-}
 
 #ifdef GTPUSP_WITH_IPV6
 //-----------------------------------------------------------------------------
@@ -606,14 +498,27 @@ gtpusp_tg4_add (
   struct sk_buff *old_skb_pP,
   const struct xt_action_param *par_pP)
 {
-  struct iphdr                           *old_iph_p = ip_hdr (old_skb_pP);
-  struct gtpuhdr                          gtpuh;
+  struct sk_buff                         *new_skb_p  = NULL;
+  struct iphdr                           *old_iph_p  = ip_hdr (old_skb_pP);
+  struct gtpuhdr                         *gtpuh      = NULL;
   uint16_t                                orig_iplen = 0;
 
   // CONNMARK
   enum ip_conntrack_info                  ctinfo;
-  struct nf_conn                         *ct = NULL;
-  u_int32_t                               newmark;
+  struct nf_conn                         *ct         = NULL;
+  u_int32_t                               newmark    = 0;
+  int                                     ret        = 0;
+  struct rtable                          *rt         = NULL;
+
+  struct flowi                            fl         = {
+    .u = {
+          .ip4 = {
+                  .daddr = ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr,
+                  .flowi4_tos = RT_TOS (old_iph_p->tos),
+                  .flowi4_scope = RT_SCOPE_UNIVERSE,
+                  }
+          }
+  };
 
   if (skb_linearize (old_skb_pP) < 0) {
     printk("%s: skb no linearize\n",MODULE_NAME);
@@ -621,6 +526,8 @@ gtpusp_tg4_add (
   }
 
   orig_iplen = ntohs (old_iph_p->tot_len);
+  rt = ip_route_output_key (&init_net, &fl.u.ip4);
+
   //----------------------------------------------------------------------------
   // CONNMARK
   //----------------------------------------------------------------------------
@@ -644,15 +551,35 @@ gtpusp_tg4_add (
     }
   }
 
-  /*
-   * Add GTPu header
-   */
-  gtpuh.flags = 0x30;           /* v1 and Protocol-type=GTP */
-  gtpuh.msgtype = 0xff;         /* T-PDU */
-  gtpuh.length = htons (orig_iplen);
-  gtpuh.tunid = htonl (((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->rtun);
-  gtpusp_sock.addr_send.sin_addr.s_addr = ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr;
-  gtpusp_ksocket_send (gtpusp_sock.sock, &gtpusp_sock.addr_send, (unsigned char *)&gtpuh, sizeof (gtpuh), (unsigned char *)old_iph_p, orig_iplen);
+
+  new_skb_p = skb_copy_expand(old_skb_pP,
+                              sizeof(struct gtpuhdr) + sizeof(struct udphdr) + sizeof(struct iphdr),
+                              0,GFP_ATOMIC);
+  if (NULL != new_skb_p) {
+    /*
+     * Add GTPu header
+     */
+    gtpuh = (struct gtpuhdr*)skb_push(new_skb_p, sizeof(*gtpuh));
+
+    gtpuh->flags   = 0x30;         /* v1 and Protocol-type=GTP */
+    gtpuh->msgtype = 0xff;         /* T-PDU */
+    gtpuh->length  = htons (orig_iplen);
+    gtpuh->tunid   = htonl (((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->rtun);
+
+    ret =  udp_tunnel_xmit_skb(gtpusp_data.sock,
+                          rt,
+                          new_skb_p,
+                          ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->laddr,
+                          ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr,
+                          old_iph_p->tos,
+                          old_iph_p->ttl,
+                          old_iph_p->frag_off,
+                          htons(gtpu_sgw_port),
+                          htons(gtpu_enb_port),
+                          0 /*bool xnet*/);
+  } else {
+    printk("%s: _gtpusp_target_add skb_copy_expand returned NULL\n", MODULE_NAME);
+  }
   return;
 }
 
@@ -703,46 +630,39 @@ static int
 __init gtpusp_tg_init(void)
 {
   int                                     err;
-  // UDP socket socket
-  memset (&gtpusp_sock, 0, sizeof (gtpusp_sock_t));
+  struct udp_tunnel_sock_cfg              tunnel_cfg;
 
-  /*
-   * create a socket
-   */
-  if ((err = sock_create (AF_INET, SOCK_DGRAM, IPPROTO_UDP, &gtpusp_sock.sock)) < 0) {
-    printk("%s: Could not create a datagram socket, error = %d\n",MODULE_NAME, -ENXIO);
+  printk("%s: init\n",MODULE_NAME);
+  // UDP socket socket
+  memset (&gtpusp_data, 0, sizeof (gtpusp_data_priv_t));
+
+  gtpusp_data.udp_conf.family            = AF_INET;
+  gtpusp_data.udp_conf.local_ip.s_addr   = in_aton (sgw_addr); // may use INADDR_ANY
+  gtpusp_data.udp_conf.use_udp_checksums = 1;
+  gtpusp_data.udp_conf.local_udp_port    = htons(gtpu_sgw_port);
+
+  /* Open UDP socket */
+  err = udp_sock_create(&init_net, &gtpusp_data.udp_conf, &gtpusp_data.sock);
+  if (err < 0) {
     return err;
   }
 
-  gtpusp_sock.addr.sin_family = AF_INET;
-  gtpusp_sock.addr.sin_port = htons (gtpu_sgw_port);
-  gtpusp_sock.addr.sin_addr.s_addr = in_aton (sgw_addr);
-  gtpusp_sock.addr_send.sin_family = AF_INET;
-  gtpusp_sock.addr_send.sin_port = htons (gtpu_enb_port);
-  gtpusp_sock.addr_send.sin_addr.s_addr = in_aton (sgw_addr);
-  gtpusp_sock.thread_stop_requested = 0;
+  gtpusp_data.addr.sin_family           = AF_INET;
+  gtpusp_data.addr.sin_port             = htons (gtpu_sgw_port);
+  gtpusp_data.addr.sin_addr.s_addr      = in_aton (sgw_addr);
+  gtpusp_data.addr_send.sin_family      = AF_INET;
+  gtpusp_data.addr_send.sin_port        = htons (gtpu_enb_port);
+  gtpusp_data.addr_send.sin_addr.s_addr = in_aton (sgw_addr);
 
-  if ((err = gtpusp_sock.sock->ops->bind (gtpusp_sock.sock, (struct sockaddr *)&gtpusp_sock.addr, sizeof (struct sockaddr))) < 0) {
-    printk("%s: Could not bind socket, error = %d\n",MODULE_NAME, -err);
-    goto close_and_out;
-  }
-  // start kernel thread
-  gtpusp_sock.thread = kthread_run ((void *)gtpusp_udp_thread, NULL, MODULE_NAME);
+  /* Mark socket as an encapsulation socket. */
+  tunnel_cfg.sk_user_data  = NULL;
+  tunnel_cfg.encap_type    = 1;
+  tunnel_cfg.encap_rcv     = gtpusp_udp_encap_recv;
+  tunnel_cfg.encap_destroy = NULL;
 
-  if (IS_ERR (gtpusp_sock.thread)) {
-    printk("%s: unable to start kernel thread\n",MODULE_NAME);
-    return -ENOMEM;
-  }
-
-  if ((gtpusp_sock.thread)) {
-    wake_up_process (gtpusp_sock.thread);
-  }
+  setup_udp_tunnel_sock(&init_net, gtpusp_data.sock, &tunnel_cfg);
 
   return xt_register_targets (gtpusp_tg_reg, ARRAY_SIZE (gtpusp_tg_reg));
-close_and_out:
-  sock_release (gtpusp_sock.sock);
-  gtpusp_sock.sock = NULL;
-  return err;
 }
 
 //-----------------------------------------------------------------------------
@@ -750,47 +670,16 @@ static void __exit
 gtpusp_tg_exit (
   void)
 {
-  int                                     err;
-  int                                     loop = 0;
-
-  if (gtpusp_sock.thread == NULL) {
-    printk("%s: no kernel thread to kill\n",MODULE_NAME);
-  } else {
-    if (gtpusp_sock.running > 0) {
-      gtpusp_sock.thread_stop_requested = 1;
-      printk("%s: exit kernel thread requested\n",MODULE_NAME);
-
-      do {
-        printk("%s: waking up thread with datagram\n",MODULE_NAME);
-        msleep (5);
-        printk("%s: waiting for thread...\n",MODULE_NAME);
-        loop++;
-      } while ((gtpusp_sock.running > 0) && (loop < 20));
-
-      if (gtpusp_sock.running > 0) {
-        printk("%s: stopping  kernel thread\n",MODULE_NAME);
-        err = kthread_stop (gtpusp_sock.thread);
-
-        if (!err) {
-          printk("%s: Successfully killed kernel thread!\n",MODULE_NAME);
-        } else {
-          printk("%s: Unsuccessfully killed kernel thread!\n",MODULE_NAME);
-        }
-      } else {
-        printk("%s: Found thread exited by itself\n",MODULE_NAME);
-      }
-    }
-  }
-
   /*
    * free allocated resources before exit
    */
-  if (gtpusp_sock.sock != NULL) {
-    sock_release (gtpusp_sock.sock);
-    gtpusp_sock.sock = NULL;
+  if (gtpusp_data.sock != NULL) {
+    udp_tunnel_sock_release(gtpusp_data.sock);
+    gtpusp_data.sock = NULL;
   }
 
   xt_unregister_targets (gtpusp_tg_reg, ARRAY_SIZE (gtpusp_tg_reg));
+  printk("%s: exited\n",MODULE_NAME);
 }
 
 
