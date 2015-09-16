@@ -96,7 +96,7 @@ static struct xt_target                 gtpusp_tg_reg[] __read_mostly = {
    .name = MODULE_NAME,
    .revision = 0,
    .family = NFPROTO_IPV4,
-   .hooks = (1 << NF_INET_POST_ROUTING) | (1 << NF_INET_LOCAL_IN) | (1 << NF_INET_FORWARD),
+   .hooks = (1 << NF_INET_POST_ROUTING) | (1 << NF_INET_LOCAL_IN) | (1 << NF_INET_FORWARD) | (1 << NF_INET_LOCAL_OUT) | (1 << NF_INET_POST_ROUTING),
    .table = "mangle",
    .target = gtpusp_tg4,
    .targetsize = sizeof (struct xt_gtpusp_target_info),
@@ -107,7 +107,7 @@ static struct xt_target                 gtpusp_tg_reg[] __read_mostly = {
    .name = MODULE_NAME,
    .revision = 0,
    .family = NFPROTO_IPV6,
-   .hooks = (1 << NF_INET_POST_ROUTING) | (1 << NF_INET_LOCAL_IN) | (1 << NF_INET_FORWARD),
+   .hooks = (1 << NF_INET_POST_ROUTING) | (1 << NF_INET_LOCAL_IN) | (1 << NF_INET_FORWARD) | (1 << NF_INET_LOCAL_OUT) | (1 << NF_INET_POST_ROUTING),
    .table = "mangle",
    .target = gtpusp_tg6,
    .targetsize = sizeof (struct xt_gtpusp_target_info),
@@ -392,7 +392,7 @@ static int gtpusp_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
       break;
 
     case GTP_GPDU:
-      printk("%s:GTP GPDU\n",MODULE_NAME);
+      //printk("%s:GTP GPDU\n",MODULE_NAME);
       gtpv1u_msg.version       = ((gtph_p->flags) & 0xE0) >> 5;
       gtpv1u_msg.protocol_type = ((gtph_p->flags) & 0x10) >> 4;
       gtpv1u_msg.ext_hdr_flag  = ((gtph_p->flags) & 0x04) >> 2;
@@ -434,6 +434,7 @@ static int gtpusp_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
         printk("%s: dst dev NULL\n",MODULE_NAME);
         return 0;
       }
+      //printk("%s: dst dev %s\n",MODULE_NAME, rt->dst.dev->name);
 
       skb_p = alloc_skb (LL_MAX_HEADER + ntohs (iph_p->tot_len), GFP_ATOMIC); // may be when S5 add more room
 
@@ -442,7 +443,7 @@ static int gtpusp_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
       }
 
       skb_p->priority = rt_tos2priority (iph_p->tos);
-      skb_p->pkt_type = PACKET_OTHERHOST; // next: try PACKET_OUTGOING
+      //skb_p->pkt_type = PACKET_OTHERHOST;
       skb_dst_set (skb_p, dst_clone (&rt->dst));
       skb_p->dev = skb_dst (skb_p)->dev;
       skb_reserve (skb_p, LL_MAX_HEADER + ntohs (iph_p->tot_len));
@@ -462,6 +463,11 @@ static int gtpusp_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
         printk("%s: Dropped skb\n",MODULE_NAME);
         kfree_skb (skb_p);
         goto drop;
+      }
+      if ((rt->dst.dev->name[0] == 'l') && (rt->dst.dev->name[1] == 'o')) {
+        skb_p->pkt_type = PACKET_HOST;
+      } else {
+        skb_p->pkt_type = PACKET_OTHERHOST;
       }
       // could be ip_send_skb() but ip_local_out is what is done inside ip_send_skb()
       ip_local_out (skb_p);
@@ -540,8 +546,8 @@ gtpusp_tg4_add (
   } else {
     //XT_CONNMARK_RESTORE:
     newmark = old_skb_pP->mark ^ ct->mark;
-    printk("%s: _gtpusp_target_add restore mark %u (skb mark %u ct mark %u) len %u sgw addr %x\n",
-           MODULE_NAME, newmark, old_skb_pP->mark, ct->mark, orig_iplen, ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr);
+    //printk("%s: _gtpusp_target_add restore mark %u (skb mark %u ct mark %u) len %u sgw addr %x\n",
+    //       MODULE_NAME, newmark, old_skb_pP->mark, ct->mark, orig_iplen, ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr);
 
     if (newmark != ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->ltun) {
       printk("%s:WARNING _gtpusp_target_add restore mark 0x%x mismatch ltun 0x%x (rtun 0x%x)", 
@@ -553,9 +559,10 @@ gtpusp_tg4_add (
 
 
   new_skb_p = skb_copy_expand(old_skb_pP,
-                              sizeof(struct gtpuhdr) + sizeof(struct udphdr) + sizeof(struct iphdr),
+                              sizeof(struct gtpuhdr) + sizeof(struct udphdr) + sizeof(struct iphdr)+ LL_MAX_HEADER,
                               0,GFP_ATOMIC);
   if (NULL != new_skb_p) {
+
     /*
      * Add GTPu header
      */
@@ -565,6 +572,7 @@ gtpusp_tg4_add (
     gtpuh->msgtype = 0xff;         /* T-PDU */
     gtpuh->length  = htons (orig_iplen);
     gtpuh->tunid   = htonl (((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->rtun);
+    //_gtpusp_print_hex_octets((const unsigned char*)new_skb_p->data, new_skb_p->len);
 
     ret =  udp_tunnel_xmit_skb(gtpusp_data.sock,
                           rt,
@@ -632,7 +640,7 @@ __init gtpusp_tg_init(void)
   int                                     err;
   struct udp_tunnel_sock_cfg              tunnel_cfg;
 
-  printk("%s: init\n",MODULE_NAME);
+  printk("%s: init (udptun version)\n",MODULE_NAME);
   // UDP socket socket
   memset (&gtpusp_data, 0, sizeof (gtpusp_data_priv_t));
 
@@ -660,6 +668,7 @@ __init gtpusp_tg_init(void)
   tunnel_cfg.encap_rcv     = gtpusp_udp_encap_recv;
   tunnel_cfg.encap_destroy = NULL;
 
+  // parameter#1=net unused in setup_udp_tunnel_sock (3.19.8/net/ipv4/udp_tunnel.c:57)
   setup_udp_tunnel_sock(&init_net, gtpusp_data.sock, &tunnel_cfg);
 
   return xt_register_targets (gtpusp_tg_reg, ARRAY_SIZE (gtpusp_tg_reg));
