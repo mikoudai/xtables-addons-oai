@@ -22,6 +22,7 @@
 #include <linux/version.h>
 #include <net/checksum.h>
 #include <net/ip.h>
+#include <net/ip_tunnels.h>
 #include <linux/in.h>
 #include <linux/icmp.h>
 #include <net/udp.h>
@@ -43,6 +44,8 @@
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
 #include <linux/uio.h>
 #endif
+
+
 // CONNMARK
 #include <net/netfilter/nf_conntrack.h>
 #include <net/netfilter/nf_conntrack_ecache.h>
@@ -102,7 +105,7 @@ static struct xt_target                 gtpusp_tg_reg[] __read_mostly = {
    .targetsize = sizeof (struct xt_gtpusp_target_info),
    .me = THIS_MODULE,
    },
-#ifdef GTPUSP_WITH_IPV6
+#if GTPUSP_WITH_IPV6
   {
    .name = MODULE_NAME,
    .revision = 0,
