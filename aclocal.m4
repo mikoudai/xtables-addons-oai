@@ -849,8 +849,6 @@ END
     AC_MSG_ERROR([Your 'rm' program is bad, sorry.])
   fi
 fi
-
-AM_SILENT_RULES([yes])
 ])
 
 dnl Hook into '_AC_COMPILER_EXEEXT' early to learn its expansion.  Do not
