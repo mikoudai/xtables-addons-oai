@@ -61,10 +61,10 @@
 #define INT_MODULE_PARM(n, v) static int n = v; module_param(n, int, 0444)
 #define STRING_MODULE_PARM(s, v) static char* s = v; module_param(s, charp, 0000);
 
-#define FLAG_GTPV1U_KERNEL_THREAD_SOCK_NO_WAIT 1
+#define GTPUSP_TIME_MEASUREMENT 0
 //-----------------------------------------------------------------------------
 
-static void  gtpusp_tg4_add (
+static int  gtpusp_tg4_add (
   struct sk_buff *old_skb_pP,
   const struct xt_action_param *par_pP);
 
@@ -184,6 +184,10 @@ INT_MODULE_PARM (gtpu_enb_port, 2153);
 MODULE_PARM_DESC (gtpu_enb_port, "UDP port number for S1U interface (eNB side)");
 STRING_MODULE_PARM (sgw_addr, "127.0.0.1");
 MODULE_PARM_DESC (sgw_addr, "IPv4 address of the S1U IP interface");
+INT_MODULE_PARM (mtu, 1500);
+MODULE_PARM_DESC (mtu, "MTU S1U interface");
+INT_MODULE_PARM (ll_max_header, 14); // VLAN_ETH_HLEN=18, ETH_HLEN=14
+MODULE_PARM_DESC (ll_max_header, "link local header length on S1-U interface");
 
 
 //-----------------------------------------------------------------------------
@@ -248,105 +252,9 @@ _gtpusp_print_hex_octets(const unsigned char const * data_pP, const unsigned sho
   buffer_marker+=snprintf(&gtpusp_print_buffer[buffer_marker], GTPUSP_2_PRINT_BUFFER_LEN - buffer_marker, " |\n");
   pr_info("%s",gtpusp_print_buffer);
 }
-//-----------------------------------------------------------------------------
-#if 0 // GTPUSP_TRACE_PACKET 
-static char *
-gtpusp_icmph_type_2_string (
-  uint8_t typeP)
-{
-  switch (typeP) {
-  case ICMP_ECHOREPLY:
-    return "ECHOREPLY";
-    break;
-
-  case ICMP_DEST_UNREACH:
-    return "DEST_UNREACH";
-    break;
-
-  case ICMP_SOURCE_QUENCH:
-    return "SOURCE_QUENCH";
-    break;
-
-  case ICMP_REDIRECT:
-    return "REDIRECT";
-    break;
-
-  case ICMP_ECHO:
-    return "ECHO";
-    break;
-
-  case ICMP_TIME_EXCEEDED:
-    return "TIME_EXCEEDED";
-    break;
-
-  case ICMP_PARAMETERPROB:
-    return "PARAMETERPROB";
-    break;
-
-  case ICMP_TIMESTAMP:
-    return "TIMESTAMP";
-    break;
-
-  case ICMP_TIMESTAMPREPLY:
-    return "TIMESTAMPREPLY";
-    break;
-
-  case ICMP_INFO_REQUEST:
-    return "INFO_REQUEST";
-    break;
-
-  case ICMP_INFO_REPLY:
-    return "INFO_REPLY";
-    break;
-
-  case ICMP_ADDRESS:
-    return "ADDRESS";
-    break;
-
-  case ICMP_ADDRESSREPLY:
-    return "ADDRESSREPLY";
-    break;
-
-  default:
-    return "TYPE?";
-  }
-}
 
 //-----------------------------------------------------------------------------
-static char                            *
-gtpusp_nf_inet_hook_2_string (
-  int nf_inet_hookP)
-{
-  switch (nf_inet_hookP) {
-  case NF_INET_PRE_ROUTING:
-    return "NF_INET_PRE_ROUTING";
-    break;
-
-  case NF_INET_LOCAL_IN:
-    return "NF_INET_LOCAL_IN";
-    break;
-
-  case NF_INET_FORWARD:
-    return "NF_INET_FORWARD";
-    break;
-
-  case NF_INET_LOCAL_OUT:
-    return "NF_INET_LOCAL_OUT";
-    break;
-
-  case NF_INET_POST_ROUTING:
-    return "NF_INET_POST_ROUTING";
-    break;
-
-  default:
-    return "NF_INET_UNKNOWN";
-  }
-}
-#endif 
 // for uplink GTPU traffic on S-GW
-//-----------------------------------------------------------------------------
-
-//-----------------------------------------------------------------------------
 /* Callback from net/ipv4/udp.c to receive packets */
 static int gtpusp_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 {
@@ -355,9 +263,7 @@ static int gtpusp_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
   int                  gtpu_extra_length = 0;
   const unsigned char *rx_buf_p  = NULL;
   struct iphdr        *iph_p     = NULL;
-  struct iphdr        *new_iph_p = NULL;
   struct rtable       *rt        = NULL;
-  struct sk_buff      *skb_p     = NULL;
   struct flowi         fl = {
     .u = {
           .ip4 = {
@@ -370,7 +276,7 @@ static int gtpusp_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 
   /* Need gtpu and ip header to be present */
   if (!pskb_may_pull(skb, sizeof(struct gtpuhdr) + sizeof(struct iphdr)))
-    goto error;
+    goto drop;
 
   /* Return packets with reserved bits set */
   gtph_p = (struct gtpuhdr *)(udp_hdr(skb) + 1);
@@ -415,7 +321,6 @@ static int gtpusp_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 
       if (iptunnel_pull_header(skb, sizeof(struct udphdr) + sizeof(struct gtpuhdr) + gtpu_extra_length, htons(ETH_P_IP)))
         goto drop;
-
       skb_reset_network_header(skb);
       skb_reset_mac_header(skb);
       skb->mark = gtpv1u_msg.teid;
@@ -430,64 +335,40 @@ static int gtpusp_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 
       if (rt == NULL) {
         printk("%s: Failed to route packet to dst 0x%x.\n",MODULE_NAME, fl.u.ip4.daddr);
-        return NF_DROP;
+        goto drop;
       }
 
       if (rt->dst.dev == NULL) {
         printk("%s: dst dev NULL\n",MODULE_NAME);
-        return 0;
+        goto drop;
       }
       //printk("%s: dst dev %s\n",MODULE_NAME, rt->dst.dev->name);
 
-      skb_p = alloc_skb (LL_MAX_HEADER + ntohs (iph_p->tot_len), GFP_ATOMIC); // may be when S5 add more room
+      skb_scrub_packet(skb, 0);
+      skb_clear_hash(skb);
+      skb_dst_set(skb, &rt->dst);
+      skb->dev = skb_dst (skb)->dev;
+      skb->protocol = htons (ETH_P_IP);
+      skb_reset_transport_header (skb);
+      skb_reset_inner_network_header (skb);
+      skb_reset_inner_transport_header (skb);
+      skb->ip_summed = CHECKSUM_NONE;
 
-      if (skb_p == NULL) {
-        return 0;
-      }
-
-      skb_p->priority = rt_tos2priority (iph_p->tos);
-      //skb_p->pkt_type = PACKET_OTHERHOST;
-      skb_dst_set (skb_p, dst_clone (&rt->dst));
-      skb_p->dev = skb_dst (skb_p)->dev;
-      skb_reserve (skb_p, LL_MAX_HEADER + ntohs (iph_p->tot_len));
-      skb_p->protocol = htons (ETH_P_IP);
-      new_iph_p = (void *)skb_push (skb_p, ntohs (iph_p->tot_len) - (iph_p->ihl << 2));
-      skb_reset_transport_header (skb_p);
-      new_iph_p = (void *)skb_push (skb_p, iph_p->ihl << 2);
-      memcpy (new_iph_p, iph_p, ntohs (iph_p->tot_len));
-      skb_reset_network_header (skb_p);
-      skb_reset_inner_network_header (skb_p);
-      skb_reset_inner_transport_header (skb_p);
-      skb_p->mark = gtpv1u_msg.teid;
-      new_iph_p->ttl = ip4_dst_hoplimit (skb_dst (skb_p));
-      skb_p->ip_summed = CHECKSUM_NONE;
-
-      if (skb_p->len > dst_mtu (skb_dst (skb_p))) {
-        printk("%s: Dropped skb\n",MODULE_NAME);
-        kfree_skb (skb_p);
-        goto drop;
-      }
       if ((rt->dst.dev->name[0] == 'l') && (rt->dst.dev->name[1] == 'o')) {
-        skb_p->pkt_type = PACKET_HOST;
+        skb->pkt_type = PACKET_HOST;
       } else {
-        skb_p->pkt_type = PACKET_OTHERHOST;
+        skb->pkt_type = PACKET_OTHERHOST;
       }
       // could be ip_send_skb() but ip_local_out is what is done inside ip_send_skb()
-      ip_local_out (skb_p);
-      goto drop;
-
+      ip_local_out (skb);
       return 0;
       break;
   }
 
 drop:
-  /* Consume bad ... and good packet */
+  /* Consume bad packet */
   kfree_skb(skb);
   return 0;
-
-error:
-  /* Return non gtp pkt */
-  return 1;
 }
 
 
@@ -502,24 +383,31 @@ gtpusp_tg6_add (
 #endif
 
 //-----------------------------------------------------------------------------
-static void
+static int
 gtpusp_tg4_add (
   struct sk_buff *old_skb_pP,
   const struct xt_action_param *par_pP)
 {
-  struct sk_buff                         *new_skb_p  = NULL;
-  struct iphdr                           *old_iph_p  = ip_hdr (old_skb_pP);
-  struct gtpuhdr                         *gtpuh      = NULL;
-  uint16_t                                orig_iplen = 0;
-
-  // CONNMARK
-  enum ip_conntrack_info                  ctinfo;
-  struct nf_conn                         *ct         = NULL;
-  u_int32_t                               newmark    = 0;
-  int                                     ret        = 0;
-  struct rtable                          *rt         = NULL;
-
-  struct flowi                            fl         = {
+  struct sk_buff                         *new_skb_p     = NULL;
+  struct sk_buff                         *new_skb2_p    = NULL;
+  struct iphdr                           *old_iph_p     = ip_hdr (old_skb_pP);
+  struct iphdr                           *iph_p         = NULL;
+  struct gtpuhdr                         *gtpuh_p       = NULL;
+  struct udphdr                          *uh_p          = NULL;
+  uint16_t                                orig_iplen    = 0;
+  int                                     reuse_old_skb = 0;
+  int                                     err           = 0;
+  int                                     old_skb_len   = old_skb_pP->len;
+  int                                     segmented     = 0;
+  int                                     ret           = 0;
+  struct rtable                          *rt            = NULL;
+  __be16                                  df1           = 0;
+  __be16                                  df2           = 0;
+  __sum16                                 check         = 0;
+  __u8                                    tos           = old_iph_p->tos;
+  __u8                                    ttl           = old_iph_p->ttl;
+  __u32                                   id            = 0;
+  struct flowi                            fl            = {
     .u = {
           .ip4 = {
                   .daddr = ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr,
@@ -528,70 +416,217 @@ gtpusp_tg4_add (
                   }
           }
   };
+#if GTPUSP_TIME_MEASUREMENT
+  struct timespec ts_start, ts_linearize, ts_route, ts_skb_cpy, ts_tun_xmit, ts1, ts2, ts3, ts4;
+  getnstimeofday(&ts_start);
+#endif
 
   if (skb_linearize (old_skb_pP) < 0) {
     printk("%s: skb no linearize\n",MODULE_NAME);
-    return;
+    return NF_DROP;
   }
+#if GTPUSP_TIME_MEASUREMENT
+  getnstimeofday(&ts_linearize);
+#endif
 
   orig_iplen = ntohs (old_iph_p->tot_len);
   rt = ip_route_output_key (&init_net, &fl.u.ip4);
-
-  //----------------------------------------------------------------------------
-  // CONNMARK
-  //----------------------------------------------------------------------------
-  ct = nf_ct_get (old_skb_pP, &ctinfo);
-
-  if (ct == NULL) {
-    printk("%s: _gtpusp_target_add force targinfo ltun %u to skb_pP mark %u\n",
-           MODULE_NAME, ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->ltun, old_skb_pP->mark);
-    newmark = ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->ltun;
-  } else {
-    //XT_CONNMARK_RESTORE:
-    newmark = old_skb_pP->mark ^ ct->mark;
-    //printk("%s: _gtpusp_target_add restore mark %u (skb mark %u ct mark %u) len %u sgw addr %x\n",
-    //       MODULE_NAME, newmark, old_skb_pP->mark, ct->mark, orig_iplen, ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr);
-
-    if (newmark != ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->ltun) {
-      printk("%s:WARNING _gtpusp_target_add restore mark 0x%x mismatch ltun 0x%x (rtun 0x%x)", 
-             MODULE_NAME, newmark,
-             ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->ltun, 
-             ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->rtun);
-    }
+#if GTPUSP_TIME_MEASUREMENT
+  getnstimeofday(&ts_route);
+#endif
+  // we assume there is always some headroom of 8 bytes :GTP
+  if (skb_headroom(old_skb_pP) <= sizeof(struct gtpuhdr)) {
+    printk("%s: skb_headroom() too small for GTP %u\n", MODULE_NAME, skb_headroom(old_skb_pP));
+    return NF_DROP;
   }
 
+  /*
+   * Add GTPu header
+   */
+  gtpuh_p = (struct gtpuhdr*)skb_push(old_skb_pP, sizeof(struct gtpuhdr));
 
-  new_skb_p = skb_copy_expand(old_skb_pP,
-                              sizeof(struct gtpuhdr) + sizeof(struct udphdr) + sizeof(struct iphdr)+ LL_MAX_HEADER,
-                              0,GFP_ATOMIC);
+  if (NULL == gtpuh_p) {
+    printk("%s: skb_push(struct gtpuhdr) returned NULL\n", MODULE_NAME);
+    return NF_DROP;
+  }
+  gtpuh_p->flags   = 0x30;         /* v1 and Protocol-type=GTP */
+  gtpuh_p->msgtype = 0xff;         /* T-PDU */
+  gtpuh_p->length  = htons (orig_iplen);
+  gtpuh_p->tunid   = htonl (((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->rtun);
+
+  segmented = sizeof(struct gtpuhdr) + sizeof(struct udphdr) + sizeof(struct iphdr)+old_skb_len - mtu;
+  if (segmented > 0) {
+    // need to segment packet since udp_tunnel_xmit_skb() does nothing about segmentation
+    // try to push up to udp header on old_skb since udp_checksum routine seems to need the whole packet(should not) (else OS crash!!!)
+    if (skb_headroom(old_skb_pP) <= sizeof(struct udphdr)) {
+      printk("%s: skb_headroom() too small for UDP %u\n", MODULE_NAME, skb_headroom(old_skb_pP));
+      return NF_DROP;
+    }
+    __skb_push(old_skb_pP, sizeof(*uh_p));
+    skb_reset_transport_header(old_skb_pP);
+    uh_p = udp_hdr(old_skb_pP);
+
+    uh_p->dest   = htons(gtpu_enb_port);
+    uh_p->source = htons(gtpu_sgw_port);
+    uh_p->len    = htons(old_skb_pP->len);
+    uh_p->check  = 0;
+
+    udp_set_csum(gtpusp_data.sock->sk->sk_no_check_tx,
+                   old_skb_pP,
+                   ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->laddr,
+                   ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr,
+                   old_skb_pP->len);
+    check = uh_p->check;
+    //printk("%s: UDP checksum udp_set_csum %04X len %d\n", MODULE_NAME, check, ntohs(uh_p->len));
+
+    new_skb_p = alloc_skb(mtu+LL_MAX_HEADER, GFP_ATOMIC);
+    if (NULL == new_skb_p) {
+      printk("%s: alloc_skb(%u) Failed\n",
+             MODULE_NAME,
+             mtu+LL_MAX_HEADER);
+      return NF_DROP;
+    }
+    if (skb_linearize (new_skb_p) < 0) {
+      printk("%s: skb_linearize() Failed\n",MODULE_NAME);
+      kfree_skb(new_skb_p);
+      return NF_DROP;
+    }
+    skb_reserve(new_skb_p, mtu + LL_MAX_HEADER);
+    memcpy(skb_push(new_skb_p, mtu - sizeof(struct iphdr)), uh_p, mtu - sizeof(struct iphdr));
+
+    if ((segmented+sizeof(struct iphdr)) > mtu) {
+      printk("%s: TODO: create more fragments (JUMBO?) packet dropped\n",MODULE_NAME);
+      kfree_skb(new_skb_p);
+      return NF_DROP;
+    }
+    new_skb2_p = alloc_skb(segmented+sizeof(struct iphdr)+LL_MAX_HEADER, GFP_ATOMIC);
+    if (NULL == new_skb2_p) {
+      printk("%s: alloc_skb(%lu) Failed\n",MODULE_NAME, segmented+sizeof(struct iphdr)+LL_MAX_HEADER);
+      kfree_skb(new_skb_p);
+      return NF_DROP;
+    }
+    if (skb_linearize (new_skb2_p) < 0) {
+      printk("%s: skb_linearize() Failed\n",MODULE_NAME);
+      kfree_skb(new_skb_p);
+      kfree_skb(new_skb2_p);
+      return NF_DROP;
+    }
+    skb_reserve(new_skb2_p, segmented+sizeof(struct iphdr)+LL_MAX_HEADER);
+    memcpy(skb_push(new_skb2_p, segmented), &old_skb_pP->data[mtu - sizeof(struct iphdr)], segmented);
+
+    df1 = htons(IP_MORE_FRAGMENTS);
+    df2 = htons((mtu-sizeof(struct iphdr))/8);
+    //printk("%s: segment %p -> %p %p\n", MODULE_NAME, old_skb_pP, new_skb_p, new_skb2_p);
+
+    // Test headroom for UE/UE traffic loop on same S-GW: copy/expand may be not needed
+    // but it occurs also sometime for other traffic
+  } else if (skb_headroom(old_skb_pP) >= (sizeof(struct udphdr) + sizeof(struct iphdr)+ ll_max_header)) {
+      reuse_old_skb = 1;
+      new_skb_p     = old_skb_pP;
+      //printk("%s: Reuse skb %p\n", MODULE_NAME, old_skb_pP);
+  } else {
+    new_skb_p = skb_copy_expand(old_skb_pP,
+                              sizeof(struct udphdr) + sizeof(struct iphdr) + LL_MAX_HEADER,
+                              0, GFP_ATOMIC);
+    //printk("%s: Copy skb %p -> %p\n", MODULE_NAME, old_skb_pP, new_skb_p);
+  }
+#if GTPUSP_TIME_MEASUREMENT
+  getnstimeofday(&ts_skb_cpy);
+#endif
   if (NULL != new_skb_p) {
-
-    /*
-     * Add GTPu header
-     */
-    gtpuh = (struct gtpuhdr*)skb_push(new_skb_p, sizeof(*gtpuh));
-
-    gtpuh->flags   = 0x30;         /* v1 and Protocol-type=GTP */
-    gtpuh->msgtype = 0xff;         /* T-PDU */
-    gtpuh->length  = htons (orig_iplen);
-    gtpuh->tunid   = htonl (((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->rtun);
     //_gtpusp_print_hex_octets((const unsigned char*)new_skb_p->data, new_skb_p->len);
-
-    ret =  udp_tunnel_xmit_skb(gtpusp_data.sock,
+    if (segmented <= 0) {
+      ret =  udp_tunnel_xmit_skb(gtpusp_data.sock,
                           rt,
                           new_skb_p,
                           ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->laddr,
                           ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr,
-                          old_iph_p->tos,
-                          old_iph_p->ttl,
-                          old_iph_p->frag_off,
+                          tos, // keep same tos
+                          ttl, // keep same ttl
+                          df1,
                           htons(gtpu_sgw_port),
                           htons(gtpu_enb_port),
                           0 /*bool xnet*/);
+    } else { // segmentation
+      //------------------------
+      // send first packet
+      //------------------------
+      //printk("%s: Send 1st segment\n", MODULE_NAME);
+      //skb_trim(new_skb_p, new_skb_p->len - segmented); //move tail pointer back, set len
+      skb_scrub_packet(new_skb_p, 0);
+      skb_clear_hash(new_skb_p);
+      skb_dst_set(new_skb_p, dst_clone(&rt->dst));
+      memset(IPCB(new_skb_p), 0, sizeof(*IPCB(new_skb_p)));
+
+      /* Push down and install the IP header. */
+      skb_push(new_skb_p, sizeof(struct iphdr));
+      skb_reset_network_header(new_skb_p);
+
+      iph_p = ip_hdr(new_skb_p);
+
+      iph_p->version  = 4;
+      iph_p->ihl      = sizeof(struct iphdr) >> 2;
+      iph_p->frag_off = df1;
+      iph_p->protocol = IPPROTO_UDP;
+      iph_p->tos      = tos;
+      iph_p->daddr    = ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr;
+      iph_p->saddr    = ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->laddr;
+      iph_p->ttl      = ttl;
+      __ip_select_ident(iph_p, 2);
+      id = iph_p->id;
+      err = ip_local_out_sk(gtpusp_data.sock->sk, new_skb_p);
+      if (unlikely(net_xmit_eval(err)))
+        printk("%s: ip_local_out_sk() may fail\n", MODULE_NAME);
+
+      //------------------------
+      // send second packet
+      //------------------------
+      //printk("%s: Send 2nd segment\n", MODULE_NAME);
+      skb_scrub_packet(new_skb2_p, 0);
+      skb_clear_hash(new_skb2_p);
+
+      skb_dst_set(new_skb2_p, dst_clone(&rt->dst));
+      memset(IPCB(new_skb2_p), 0, sizeof(*IPCB(new_skb2_p)));
+
+      /* Push down and install the IP header. */
+      skb_push(new_skb2_p, sizeof(struct iphdr));
+      skb_reset_network_header(new_skb2_p);
+
+      iph_p = ip_hdr(new_skb2_p);
+
+      iph_p->version  = 4;
+      iph_p->ihl      = sizeof(struct iphdr) >> 2;
+      iph_p->frag_off = df2;
+      iph_p->protocol = IPPROTO_UDP;
+      iph_p->tos      = tos;
+      iph_p->daddr    = ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr;
+      iph_p->saddr    = ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->laddr;
+      iph_p->ttl      = ttl;
+      iph_p->id       = id;
+      err = ip_local_out_sk(gtpusp_data.sock->sk, new_skb2_p);
+      if (unlikely(net_xmit_eval(err)))
+        printk("%s: ip_local_out_sk() may fail\n", MODULE_NAME);
+
+    }
+#if GTPUSP_TIME_MEASUREMENT
+    getnstimeofday(&ts_tun_xmit);
+#endif
   } else {
     printk("%s: _gtpusp_target_add skb_copy_expand returned NULL\n", MODULE_NAME);
+    return NF_DROP;
   }
-  return;
+#if GTPUSP_TIME_MEASUREMENT
+  ts1 = timespec_sub(ts_tun_xmit,  ts_skb_cpy);
+  ts2 = timespec_sub(ts_skb_cpy,   ts_route);
+  ts3 = timespec_sub(ts_route,     ts_linearize);
+  ts4 = timespec_sub(ts_linearize, ts_start);
+  printk("GTPUSP DL timing: tun_xmit %09lu  skb_cpy %09lu  route %09lu  skb_linearize %09lu\n",
+          (unsigned long)ts1.tv_nsec,(unsigned long)ts2.tv_nsec,(unsigned long)ts3.tv_nsec,(unsigned long)ts4.tv_nsec);
+#endif
+  if (0 == reuse_old_skb) {
+    kfree_skb(old_skb_pP);
+  }
+  return NF_STOLEN;
 }
 
 #ifdef GTPUSP_WITH_IPV6
@@ -629,8 +664,7 @@ gtpusp_tg4 (
   }
 
   if (tgi_p->action == PARAM_GTPUSP_ACTION_ADD) {
-    gtpusp_tg4_add (skb_pP, par_pP);
-    return NF_DROP;
+    return gtpusp_tg4_add (skb_pP, par_pP);
   }
 
   return NF_ACCEPT;
@@ -643,14 +677,16 @@ __init gtpusp_tg_init(void)
   int                                     err;
   struct udp_tunnel_sock_cfg              tunnel_cfg;
 
-  printk("%s: init (udptun version)\n",MODULE_NAME);
+  printk("%s: init (built %s %s)\n",MODULE_NAME, __DATE__, __TIME__);
   // UDP socket socket
   memset (&gtpusp_data, 0, sizeof (gtpusp_data_priv_t));
 
-  gtpusp_data.udp_conf.family            = AF_INET;
-  gtpusp_data.udp_conf.local_ip.s_addr   = in_aton (sgw_addr); // may use INADDR_ANY
-  gtpusp_data.udp_conf.use_udp_checksums = 1;
-  gtpusp_data.udp_conf.local_udp_port    = htons(gtpu_sgw_port);
+  gtpusp_data.udp_conf.family                = AF_INET;
+  gtpusp_data.udp_conf.local_ip.s_addr       = in_aton (sgw_addr); // may use INADDR_ANY
+  gtpusp_data.udp_conf.use_udp_checksums     = 1;
+  gtpusp_data.udp_conf.use_udp6_tx_checksums = 0;
+  gtpusp_data.udp_conf.use_udp6_rx_checksums = 0;
+  gtpusp_data.udp_conf.local_udp_port        = htons(gtpu_sgw_port);
 
   /* Open UDP socket */
   err = udp_sock_create(&init_net, &gtpusp_data.udp_conf, &gtpusp_data.sock);
