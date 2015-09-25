@@ -395,23 +395,19 @@ gtpusp_tg4_add (
   struct gtpuhdr                         *gtpuh_p       = NULL;
   struct udphdr                          *uh_p          = NULL;
   uint16_t                                orig_iplen    = 0;
-  int                                     reuse_old_skb  = 0;
+  int                                     reuse_old_skb = 0;
+  int                                     err           = 0;
   int                                     old_skb_len   = old_skb_pP->len;
   int                                     segmented     = 0;
-
-  // CONNMARK
-  //enum ip_conntrack_info                  ctinfo;
-  //struct nf_conn                         *ct         = NULL;
-  //u_int32_t                               newmark    = 0;
-  int                                     ret        = 0;
-  struct rtable                          *rt         = NULL;
-  __be16                                  df1        = 0;
-  __be16                                  df2        = 0;
-  __u8                                    tos        = old_iph_p->tos;
-  __u8                                    ttl        = old_iph_p->ttl;
-  __u32                                   id         = 0;
-
-  struct flowi                            fl         = {
+  int                                     ret           = 0;
+  struct rtable                          *rt            = NULL;
+  __be16                                  df1           = 0;
+  __be16                                  df2           = 0;
+  __sum16                                 check         = 0;
+  __u8                                    tos           = old_iph_p->tos;
+  __u8                                    ttl           = old_iph_p->ttl;
+  __u32                                   id            = 0;
+  struct flowi                            fl            = {
     .u = {
           .ip4 = {
                   .daddr = ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr,
@@ -424,7 +420,6 @@ gtpusp_tg4_add (
   struct timespec ts_start, ts_linearize, ts_route, ts_skb_cpy, ts_tun_xmit, ts1, ts2, ts3, ts4;
   getnstimeofday(&ts_start);
 #endif
-
 
   if (skb_linearize (old_skb_pP) < 0) {
     printk("%s: skb no linearize\n",MODULE_NAME);
@@ -439,37 +434,56 @@ gtpusp_tg4_add (
 #if GTPUSP_TIME_MEASUREMENT
   getnstimeofday(&ts_route);
 #endif
+  // we assume there is always some headroom of 8 bytes :GTP
+  if (skb_headroom(old_skb_pP) <= sizeof(struct gtpuhdr)) {
+    printk("%s: skb_headroom() too small for GTP %u\n", MODULE_NAME, skb_headroom(old_skb_pP));
+    return NF_DROP;
+  }
 
-  //----------------------------------------------------------------------------
-  // CONNMARK
-  //----------------------------------------------------------------------------
-  /*ct = nf_ct_get (old_skb_pP, &ctinfo);
+  /*
+   * Add GTPu header
+   */
+  gtpuh_p = (struct gtpuhdr*)skb_push(old_skb_pP, sizeof(struct gtpuhdr));
 
-  if (ct == NULL) {
-    printk("%s: _gtpusp_target_add force targinfo ltun %u to skb_pP mark %u\n",
-           MODULE_NAME, ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->ltun, old_skb_pP->mark);
-    newmark = ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->ltun;
-  } else {
-    //XT_CONNMARK_RESTORE:
-    newmark = old_skb_pP->mark ^ ct->mark;
-    printk("%s: _gtpusp_target_add restore mark %u (skb mark %u ct mark %u) len %u sgw addr %x\n",
-           MODULE_NAME, newmark, old_skb_pP->mark, ct->mark, orig_iplen, ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr);
-
-    if (newmark != ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->ltun) {
-      printk("%s:WARNING _gtpusp_target_add restore mark 0x%x mismatch ltun 0x%x (rtun 0x%x)", 
-             MODULE_NAME, newmark,
-             ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->ltun, 
-             ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->rtun);
-    }
-  }*/
-
-
+  if (NULL == gtpuh_p) {
+    printk("%s: skb_push(struct gtpuhdr) returned NULL\n", MODULE_NAME);
+    return NF_DROP;
+  }
+  gtpuh_p->flags   = 0x30;         /* v1 and Protocol-type=GTP */
+  gtpuh_p->msgtype = 0xff;         /* T-PDU */
+  gtpuh_p->length  = htons (orig_iplen);
+  gtpuh_p->tunid   = htonl (((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->rtun);
 
   segmented = sizeof(struct gtpuhdr) + sizeof(struct udphdr) + sizeof(struct iphdr)+old_skb_len - mtu;
   if (segmented > 0) {
+    // need to segment packet since udp_tunnel_xmit_skb() does nothing about segmentation
+    // try to push up to udp header on old_skb since udp_checksum routine seems to need the whole packet(should not) (else OS crash!!!)
+    if (skb_headroom(old_skb_pP) <= sizeof(struct udphdr)) {
+      printk("%s: skb_headroom() too small for UDP %u\n", MODULE_NAME, skb_headroom(old_skb_pP));
+      return NF_DROP;
+    }
+    __skb_push(old_skb_pP, sizeof(*uh_p));
+    skb_reset_transport_header(old_skb_pP);
+    uh_p = udp_hdr(old_skb_pP);
+
+    uh_p->dest   = htons(gtpu_enb_port);
+    uh_p->source = htons(gtpu_sgw_port);
+    uh_p->len    = htons(old_skb_pP->len);
+    uh_p->check  = 0;
+
+    udp_set_csum(gtpusp_data.sock->sk->sk_no_check_tx,
+                   old_skb_pP,
+                   ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->laddr,
+                   ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr,
+                   old_skb_pP->len);
+    check = uh_p->check;
+    //printk("%s: UDP checksum udp_set_csum %04X len %d\n", MODULE_NAME, check, ntohs(uh_p->len));
+
     new_skb_p = alloc_skb(mtu+LL_MAX_HEADER, GFP_ATOMIC);
     if (NULL == new_skb_p) {
-      printk("%s: alloc_skb(%u) Failed\n",MODULE_NAME, mtu+LL_MAX_HEADER);
+      printk("%s: alloc_skb(%u) Failed\n",
+             MODULE_NAME,
+             mtu+LL_MAX_HEADER);
       return NF_DROP;
     }
     if (skb_linearize (new_skb_p) < 0) {
@@ -478,7 +492,7 @@ gtpusp_tg4_add (
       return NF_DROP;
     }
     skb_reserve(new_skb_p, mtu + LL_MAX_HEADER);
-    memcpy(skb_push(new_skb_p, old_skb_len - segmented), old_iph_p, old_skb_len - segmented);
+    memcpy(skb_push(new_skb_p, mtu - sizeof(struct iphdr)), uh_p, mtu - sizeof(struct iphdr));
 
     new_skb2_p = alloc_skb(segmented+sizeof(struct iphdr)+LL_MAX_HEADER, GFP_ATOMIC);
     if (NULL == new_skb2_p) {
@@ -493,57 +507,28 @@ gtpusp_tg4_add (
       return NF_DROP;
     }
     skb_reserve(new_skb2_p, segmented+sizeof(struct iphdr)+LL_MAX_HEADER);
-    memcpy(skb_push(new_skb2_p, segmented), &old_skb_pP->data[old_skb_len - segmented], segmented);
-
-
-
-    /*skb_trim(old_skb_pP, old_skb_len - segmented); //move tail pointer back, set len
-
-    new_skb_p = skb_copy_expand(old_skb_pP,
-                              sizeof(struct gtpuhdr) + sizeof(struct udphdr) + sizeof(struct iphdr)+ ll_max_header,
-                              0,GFP_ATOMIC);
-    skb_put(old_skb_pP, segmented); // reset to original, move tail pointer forward, increase len
-    skb_pull(old_skb_pP, old_skb_len - segmented); // remove data from the start of a buffer, move data forward, decrease len
-    */
+    memcpy(skb_push(new_skb2_p, segmented), &old_skb_pP->data[mtu - sizeof(struct iphdr)], segmented);
 
     df1 = htons(IP_MORE_FRAGMENTS);
     df2 = htons((mtu-sizeof(struct iphdr))/8);
-    printk("%s: segment %p -> %p %p\n", MODULE_NAME, old_skb_pP, new_skb_p, new_skb2_p);
+    //printk("%s: segment %p -> %p %p\n", MODULE_NAME, old_skb_pP, new_skb_p, new_skb2_p);
 
     // Test headroom for UE/UE traffic loop on same S-GW: copy/expand may be not needed
     // but it occurs also sometime for other traffic
-  } else if (skb_headroom(old_skb_pP) >= (sizeof(struct gtpuhdr) + sizeof(struct udphdr) + sizeof(struct iphdr)+ ll_max_header)) {
+  } else if (skb_headroom(old_skb_pP) >= (sizeof(struct udphdr) + sizeof(struct iphdr)+ ll_max_header)) {
       reuse_old_skb = 1;
       new_skb_p     = old_skb_pP;
-      printk("%s: Reuse skb %p\n", MODULE_NAME, old_skb_pP);
+      //printk("%s: Reuse skb %p\n", MODULE_NAME, old_skb_pP);
   } else {
     new_skb_p = skb_copy_expand(old_skb_pP,
-                              sizeof(struct gtpuhdr) + sizeof(struct udphdr) + sizeof(struct iphdr) + ll_max_header,
+                              sizeof(struct udphdr) + sizeof(struct iphdr) + LL_MAX_HEADER,
                               0, GFP_ATOMIC);
-    printk("%s: Copy skb %p -> %p\n", MODULE_NAME, old_skb_pP, new_skb_p);
+    //printk("%s: Copy skb %p -> %p\n", MODULE_NAME, old_skb_pP, new_skb_p);
   }
 #if GTPUSP_TIME_MEASUREMENT
   getnstimeofday(&ts_skb_cpy);
 #endif
   if (NULL != new_skb_p) {
-    /*
-     * Add GTPu header
-     */
-    gtpuh_p = (struct gtpuhdr*)skb_push(new_skb_p, sizeof(struct gtpuhdr));
-
-    if (NULL == gtpuh_p) {
-      printk("%s: skb_push(struct gtpuhdr) returned NULL\n", MODULE_NAME);
-      if (reuse_old_skb == 0) {
-        kfree_skb(new_skb_p);
-      }
-      return NF_DROP;
-    }
-    gtpuh_p->flags   = 0x30;         /* v1 and Protocol-type=GTP */
-    gtpuh_p->msgtype = 0xff;         /* T-PDU */
-    gtpuh_p->length  = htons (orig_iplen);
-    gtpuh_p->tunid   = htonl (((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->rtun);
-
-    //new_skb_p->ignore_df = 1; // may fragment anyway
     //_gtpusp_print_hex_octets((const unsigned char*)new_skb_p->data, new_skb_p->len);
     if (segmented <= 0) {
       ret =  udp_tunnel_xmit_skb(gtpusp_data.sock,
@@ -557,32 +542,14 @@ gtpusp_tg4_add (
                           htons(gtpu_sgw_port),
                           htons(gtpu_enb_port),
                           0 /*bool xnet*/);
-    } else { // segmentation, handle the ip header id
-      printk("%s: Send 1st segment\n", MODULE_NAME);
-      __skb_push(new_skb_p, sizeof(*uh_p));
-      skb_reset_transport_header(new_skb_p);
-      uh_p = udp_hdr(new_skb_p);
-
-      uh_p->dest = htons(gtpu_enb_port);
-      uh_p->source = htons(gtpu_sgw_port);
-      uh_p->len = htons(new_skb_p->len+segmented);
-      uh_p->check  = 0;
-      /*uh_p->check  = csum_tcpudp_magic(((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->laddr,
-                                       ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr,
-                                       new_skb_p->len+segmented,
-                                       IPPROTO_UDP,
-                                       csum_partial((char*)uh_p, sizeof(struct udphdr), csum_partial((char*)old_iph_p, orig_iplen, 0)));*/
-
-      new_skb_p->ip_summed   = CHECKSUM_PARTIAL;
-      new_skb_p->csum_start  = skb_transport_header(new_skb_p) - new_skb_p->head;
-      new_skb_p->csum_offset = offsetof(struct udphdr, check);
-      uh_p->check = ~udp_v4_check(new_skb_p->len+segmented,
-                                  ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->laddr,
-                                  ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr,
-                                  0);
-
-      //skb_scrub_packet(new_skb_p, 0);
-      //skb_clear_hash(new_skb_p);
+    } else { // segmentation
+      //------------------------
+      // send first packet
+      //------------------------
+      //printk("%s: Send 1st segment\n", MODULE_NAME);
+      //skb_trim(new_skb_p, new_skb_p->len - segmented); //move tail pointer back, set len
+      skb_scrub_packet(new_skb_p, 0);
+      skb_clear_hash(new_skb_p);
       skb_dst_set(new_skb_p, dst_clone(&rt->dst));
       memset(IPCB(new_skb_p), 0, sizeof(*IPCB(new_skb_p)));
 
@@ -602,13 +569,16 @@ gtpusp_tg4_add (
       iph_p->ttl      = ttl;
       __ip_select_ident(iph_p, 2);
       id = iph_p->id;
-      ip_local_out_sk(gtpusp_data.sock->sk, new_skb_p);
+      err = ip_local_out_sk(gtpusp_data.sock->sk, new_skb_p);
+      if (unlikely(net_xmit_eval(err)))
+        printk("%s: ip_local_out_sk() may fail\n", MODULE_NAME);
 
-
+      //------------------------
       // send second packet
-      printk("%s: Send 2nd segment\n", MODULE_NAME);
-      //skb_scrub_packet(new_skb2_p, 0);
-      //skb_clear_hash(new_skb2_p);
+      //------------------------
+      //printk("%s: Send 2nd segment\n", MODULE_NAME);
+      skb_scrub_packet(new_skb2_p, 0);
+      skb_clear_hash(new_skb2_p);
 
       skb_dst_set(new_skb2_p, dst_clone(&rt->dst));
       memset(IPCB(new_skb2_p), 0, sizeof(*IPCB(new_skb2_p)));
@@ -628,7 +598,10 @@ gtpusp_tg4_add (
       iph_p->saddr    = ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->laddr;
       iph_p->ttl      = ttl;
       iph_p->id       = id;
-      ip_local_out_sk(gtpusp_data.sock->sk, new_skb2_p);
+      err = ip_local_out_sk(gtpusp_data.sock->sk, new_skb2_p);
+      if (unlikely(net_xmit_eval(err)))
+        printk("%s: ip_local_out_sk() may fail\n", MODULE_NAME);
+
     }
 #if GTPUSP_TIME_MEASUREMENT
     getnstimeofday(&ts_tun_xmit);
