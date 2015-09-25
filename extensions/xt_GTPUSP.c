@@ -494,6 +494,11 @@ gtpusp_tg4_add (
     skb_reserve(new_skb_p, mtu + LL_MAX_HEADER);
     memcpy(skb_push(new_skb_p, mtu - sizeof(struct iphdr)), uh_p, mtu - sizeof(struct iphdr));
 
+    if ((segmented+sizeof(struct iphdr)) > mtu) {
+      printk("%s: TODO: create more fragments (JUMBO?) packet dropped\n",MODULE_NAME);
+      kfree_skb(new_skb_p);
+      return NF_DROP;
+    }
     new_skb2_p = alloc_skb(segmented+sizeof(struct iphdr)+LL_MAX_HEADER, GFP_ATOMIC);
     if (NULL == new_skb2_p) {
       printk("%s: alloc_skb(%lu) Failed\n",MODULE_NAME, segmented+sizeof(struct iphdr)+LL_MAX_HEADER);
