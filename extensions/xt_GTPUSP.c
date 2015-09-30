@@ -61,7 +61,8 @@
 #define INT_MODULE_PARM(n, v) static int n = v; module_param(n, int, 0444)
 #define STRING_MODULE_PARM(s, v) static char* s = v; module_param(s, charp, 0000);
 
-#define GTPUSP_TIME_MEASUREMENT 0
+#define GTPUSP_TIME_MEASUREMENT    0
+#define GTPUSP_USE_SKB_COPY_EXPAND 0
 //-----------------------------------------------------------------------------
 
 static int  gtpusp_tg4_add (
@@ -459,46 +460,79 @@ gtpusp_tg4_add (
     // need to segment packet since udp_tunnel_xmit_skb() does nothing about segmentation
     // try to push up to udp header on old_skb since udp_checksum routine seems to need the whole packet(should not) (else OS crash!!!)
     if (skb_headroom(old_skb_pP) <= sizeof(struct udphdr)) {
-      printk("%s: skb_headroom() too small for UDP %u\n", MODULE_NAME, skb_headroom(old_skb_pP));
-      return NF_DROP;
-    }
-    __skb_push(old_skb_pP, sizeof(*uh_p));
-    skb_reset_transport_header(old_skb_pP);
-    uh_p = udp_hdr(old_skb_pP);
+      //printk("%s: skb_headroom() too small for UDP %u, occurs for locally generated packets\n", MODULE_NAME, skb_headroom(old_skb_pP));
 
-    uh_p->dest   = htons(gtpu_enb_port);
-    uh_p->source = htons(gtpu_sgw_port);
-    uh_p->len    = htons(old_skb_pP->len);
-    uh_p->check  = 0;
+      new_skb_p = alloc_skb(old_skb_pP->len+sizeof(struct udphdr) + sizeof(struct iphdr)+LL_MAX_HEADER, GFP_ATOMIC);
+      if (NULL == new_skb_p) {
+        printk("%s: alloc_skb(%lu) Failed (local traffic)\n",
+             MODULE_NAME,
+             old_skb_pP->len + sizeof(struct udphdr) + sizeof(struct iphdr)+LL_MAX_HEADER);
+        return NF_DROP;
+      }
+      if (skb_linearize (new_skb_p) < 0) {
+        printk("%s: skb_linearize() Failed\n",MODULE_NAME);
+        kfree_skb(new_skb_p);
+        return NF_DROP;
+      }
+      skb_reserve(new_skb_p, old_skb_pP->len+sizeof(struct udphdr) + sizeof(struct iphdr)+LL_MAX_HEADER);
+      memcpy(skb_push(new_skb_p, old_skb_pP->len), old_skb_pP->data, old_skb_pP->len);
 
-    udp_set_csum(gtpusp_data.sock->sk->sk_no_check_tx,
+      __skb_push(new_skb_p, sizeof(*uh_p));
+      skb_reset_transport_header(new_skb_p);
+      uh_p = udp_hdr(new_skb_p);
+
+      uh_p->dest   = htons(gtpu_enb_port);
+      uh_p->source = htons(gtpu_sgw_port);
+      uh_p->len    = htons(new_skb_p->len);
+      uh_p->check  = 0;
+
+      udp_set_csum(gtpusp_data.sock->sk->sk_no_check_tx,
+                   new_skb_p,
+                   ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->laddr,
+                   ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr,
+                   new_skb_p->len);
+      // shrink packet
+      skb_trim(old_skb_pP, mtu -  sizeof(struct iphdr));
+    } else {
+      __skb_push(old_skb_pP, sizeof(*uh_p));
+      skb_reset_transport_header(old_skb_pP);
+      uh_p = udp_hdr(old_skb_pP);
+
+      uh_p->dest   = htons(gtpu_enb_port);
+      uh_p->source = htons(gtpu_sgw_port);
+      uh_p->len    = htons(old_skb_pP->len);
+      uh_p->check  = 0;
+
+      udp_set_csum(gtpusp_data.sock->sk->sk_no_check_tx,
                    old_skb_pP,
                    ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->laddr,
                    ((const struct xt_gtpusp_target_info *)(par_pP->targinfo))->raddr,
                    old_skb_pP->len);
-    check = uh_p->check;
-    //printk("%s: UDP checksum udp_set_csum %04X len %d\n", MODULE_NAME, check, ntohs(uh_p->len));
+      check = uh_p->check;
+      //printk("%s: UDP checksum udp_set_csum %04X len %d\n", MODULE_NAME, check, ntohs(uh_p->len));
 
-    new_skb_p = alloc_skb(mtu+LL_MAX_HEADER, GFP_ATOMIC);
-    if (NULL == new_skb_p) {
-      printk("%s: alloc_skb(%u) Failed\n",
+      new_skb_p = alloc_skb(mtu+LL_MAX_HEADER, GFP_ATOMIC);
+      if (NULL == new_skb_p) {
+        printk("%s: alloc_skb(%u) Failed\n",
              MODULE_NAME,
              mtu+LL_MAX_HEADER);
-      return NF_DROP;
-    }
-    if (skb_linearize (new_skb_p) < 0) {
-      printk("%s: skb_linearize() Failed\n",MODULE_NAME);
-      kfree_skb(new_skb_p);
-      return NF_DROP;
-    }
-    skb_reserve(new_skb_p, mtu + LL_MAX_HEADER);
-    memcpy(skb_push(new_skb_p, mtu - sizeof(struct iphdr)), uh_p, mtu - sizeof(struct iphdr));
+        return NF_DROP;
+      }
+      if (skb_linearize (new_skb_p) < 0) {
+        printk("%s: skb_linearize() Failed\n",MODULE_NAME);
+        kfree_skb(new_skb_p);
+        return NF_DROP;
+      }
+      skb_reserve(new_skb_p, mtu + LL_MAX_HEADER);
+      memcpy(skb_push(new_skb_p, mtu - sizeof(struct iphdr)), uh_p, mtu - sizeof(struct iphdr));
 
-    if ((segmented+sizeof(struct iphdr)) > mtu) {
-      printk("%s: TODO: create more fragments (JUMBO?) packet dropped\n",MODULE_NAME);
-      kfree_skb(new_skb_p);
-      return NF_DROP;
+      if ((segmented+sizeof(struct iphdr)) > mtu) {
+        printk("%s: TODO: create more fragments (JUMBO?) packet dropped\n",MODULE_NAME);
+        kfree_skb(new_skb_p);
+        return NF_DROP;
+      }
     }
+
     new_skb2_p = alloc_skb(segmented+sizeof(struct iphdr)+LL_MAX_HEADER, GFP_ATOMIC);
     if (NULL == new_skb2_p) {
       printk("%s: alloc_skb(%lu) Failed\n",MODULE_NAME, segmented+sizeof(struct iphdr)+LL_MAX_HEADER);
@@ -525,10 +559,26 @@ gtpusp_tg4_add (
       new_skb_p     = old_skb_pP;
       //printk("%s: Reuse skb %p\n", MODULE_NAME, old_skb_pP);
   } else {
+#if GTPUSP_USE_SKB_COPY_EXPAND
     new_skb_p = skb_copy_expand(old_skb_pP,
                               sizeof(struct udphdr) + sizeof(struct iphdr) + LL_MAX_HEADER,
                               0, GFP_ATOMIC);
-    //printk("%s: Copy skb %p -> %p\n", MODULE_NAME, old_skb_pP, new_skb_p);
+#else
+    new_skb_p = alloc_skb(old_skb_pP->len+sizeof(struct udphdr) + sizeof(struct iphdr) + LL_MAX_HEADER, GFP_ATOMIC);
+    if (NULL == new_skb_p) {
+      printk("%s: alloc_skb(%lu) Failed\n",
+           MODULE_NAME,
+           old_skb_pP->len + sizeof(struct udphdr) + sizeof(struct iphdr) + LL_MAX_HEADER);
+      return NF_DROP;
+    }
+    if (skb_linearize (new_skb_p) < 0) {
+      printk("%s: skb_linearize() Failed\n",MODULE_NAME);
+      kfree_skb(new_skb_p);
+      return NF_DROP;
+    }
+    skb_reserve(new_skb_p, old_skb_pP->len + sizeof(struct udphdr) + sizeof(struct iphdr) + LL_MAX_HEADER);
+    memcpy(skb_push(new_skb_p, old_skb_pP->len), old_skb_pP->data, old_skb_pP->len);
+#endif
   }
 #if GTPUSP_TIME_MEASUREMENT
   getnstimeofday(&ts_skb_cpy);
